@@ -1346,10 +1346,39 @@ def get_journal(issue_id: int, journal_id: int) -> str:
         return f"系統錯誤: {str(e)}"
 
 
-# 圖片處理相關常數
-MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024  # 10MB
+# 附件處理相關常數
+MAX_ATTACHMENT_SIZE_BYTES = 10 * 1024 * 1024  # 10MB
+MAX_TEXT_OUTPUT_LENGTH = 50000  # 文字輸出最大字元數
 DEFAULT_THUMBNAIL_SIZE = 800  # 預設縮圖最大邊長
 SUPPORTED_IMAGE_TYPES = {'image/png', 'image/jpeg', 'image/gif', 'image/webp'}
+
+# 明確支援的文字 MIME 類型
+TEXT_MIME_TYPES = {
+    'text/plain', 'text/html', 'text/css', 'text/csv',
+    'text/xml', 'text/javascript', 'text/markdown',
+    'application/json', 'application/xml',
+    'application/javascript', 'application/x-yaml',
+    'application/x-sh', 'application/sql',
+}
+
+# 副檔名對應的文件類型（用於 content_type 不準確時的備援判斷）
+TEXT_EXTENSIONS = {
+    '.txt', '.csv', '.json', '.xml', '.yaml', '.yml',
+    '.html', '.htm', '.css', '.js', '.ts', '.md',
+    '.sh', '.bash', '.zsh', '.py', '.rb', '.php',
+    '.java', '.go', '.rs', '.sql', '.log', '.ini',
+    '.cfg', '.conf', '.toml', '.env', '.gitignore',
+}
+
+OFFICE_EXTENSIONS = {
+    '.pdf': 'pdf',
+    '.docx': 'docx',
+    '.xlsx': 'xlsx',
+    '.pptx': 'pptx',
+}
+
+# 舊版 Office 格式（不支援直接解析）
+LEGACY_OFFICE_EXTENSIONS = {'.doc', '.xls', '.ppt'}
 
 
 @mcp.tool()
@@ -1389,10 +1418,10 @@ def get_attachment_image(
                    f"支援格式: {', '.join(SUPPORTED_IMAGE_TYPES)}"
         
         # 檢查檔案大小
-        if filesize > MAX_IMAGE_SIZE_BYTES:
+        if filesize > MAX_ATTACHMENT_SIZE_BYTES:
             return f"附件 #{attachment_id} ({filename}) 檔案過大\n" \
                    f"大小: {filesize / 1024 / 1024:.2f} MB\n" \
-                   f"限制: {MAX_IMAGE_SIZE_BYTES / 1024 / 1024:.0f} MB"
+                   f"限制: {MAX_ATTACHMENT_SIZE_BYTES / 1024 / 1024:.0f} MB"
         
         # 處理圖片
         img = PILImage.open(BytesIO(image_data))
@@ -1439,6 +1468,231 @@ def get_attachment_image(
         return f"處理圖片錯誤: {str(e)}"
 
 
+def _get_file_extension(filename: str) -> str:
+    """取得檔案副檔名（小寫）"""
+    return os.path.splitext(filename)[1].lower()
+
+
+def _extract_pdf_text(data: bytes) -> str:
+    """從 PDF 提取文字"""
+    from io import BytesIO
+    from pypdf import PdfReader
+
+    reader = PdfReader(BytesIO(data))
+    pages = []
+    for i, page in enumerate(reader.pages):
+        text = page.extract_text()
+        if text and text.strip():
+            pages.append(f"--- 第 {i + 1} 頁 ---\n{text.strip()}")
+
+    if not pages:
+        return "(PDF 無法提取文字內容，可能為掃描圖片型 PDF)"
+    return "\n\n".join(pages)
+
+
+def _extract_docx_text(data: bytes) -> str:
+    """從 Word (.docx) 提取文字"""
+    from io import BytesIO
+    from docx import Document
+
+    doc = Document(BytesIO(data))
+    paragraphs = []
+    for para in doc.paragraphs:
+        if para.text.strip():
+            paragraphs.append(para.text)
+
+    # 也提取表格內容
+    for table in doc.tables:
+        rows = []
+        for row in table.rows:
+            cells = [cell.text.strip() for cell in row.cells]
+            rows.append(" | ".join(cells))
+        if rows:
+            paragraphs.append("\n[表格]\n" + "\n".join(rows))
+
+    if not paragraphs:
+        return "(Word 文件無文字內容)"
+    return "\n\n".join(paragraphs)
+
+
+def _extract_xlsx_text(data: bytes) -> str:
+    """從 Excel (.xlsx) 提取表格文字"""
+    from io import BytesIO
+    from openpyxl import load_workbook
+
+    wb = load_workbook(BytesIO(data), read_only=True, data_only=True)
+    sheets = []
+
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        rows = []
+        for row in ws.iter_rows(values_only=True):
+            cells = [str(cell) if cell is not None else "" for cell in row]
+            if any(c for c in cells):
+                rows.append(" | ".join(cells))
+        if rows:
+            sheets.append(f"--- 工作表: {sheet_name} ---\n" + "\n".join(rows))
+
+    wb.close()
+    if not sheets:
+        return "(Excel 檔案無內容)"
+    return "\n\n".join(sheets)
+
+
+def _extract_pptx_text(data: bytes) -> str:
+    """從 PowerPoint (.pptx) 提取文字"""
+    from io import BytesIO
+    from pptx import Presentation
+
+    prs = Presentation(BytesIO(data))
+    slides = []
+
+    for i, slide in enumerate(prs.slides):
+        texts = []
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                for para in shape.text_frame.paragraphs:
+                    if para.text.strip():
+                        texts.append(para.text.strip())
+            if shape.has_table:
+                for row in shape.table.rows:
+                    cells = [cell.text.strip() for cell in row.cells]
+                    texts.append(" | ".join(cells))
+        if texts:
+            slides.append(f"--- 投影片 {i + 1} ---\n" + "\n".join(texts))
+
+    if not slides:
+        return "(簡報無文字內容)"
+    return "\n\n".join(slides)
+
+
+def _try_decode_text(data: bytes) -> str | None:
+    """嘗試將 bytes 解碼為文字，失敗返回 None"""
+    for encoding in ('utf-8', 'utf-8-sig', 'big5', 'gb2312', 'shift_jis', 'latin-1'):
+        try:
+            text = data.decode(encoding)
+            # 檢查是否含有過多不可列印字元（binary 特徵）
+            non_printable = sum(1 for c in text[:1000] if not c.isprintable() and c not in '\n\r\t')
+            if non_printable / max(len(text[:1000]), 1) > 0.1:
+                continue
+            return text
+        except (UnicodeDecodeError, ValueError):
+            continue
+    return None
+
+
+@mcp.tool()
+def get_attachment_text(
+    attachment_id: int,
+    max_length: int = MAX_TEXT_OUTPUT_LENGTH
+) -> str:
+    """
+    讀取 Redmine 附件的文字內容
+
+    支援格式：
+    - 文件類：PDF、Word (.docx)、Excel (.xlsx)、PowerPoint (.pptx)
+    - 文字類：TXT、JSON、XML、CSV、HTML、Markdown、程式碼等
+    - 其他：自動嘗試以純文字讀取，binary 檔案會提示不支援
+
+    注意：圖片請使用 get_attachment_image()
+
+    Args:
+        attachment_id: 附件 ID
+        max_length: 文字輸出最大字元數（預設 50000）
+
+    Returns:
+        附件的文字內容或錯誤訊息
+    """
+    try:
+        client = get_client()
+
+        # 下載附件
+        file_data, attachment_info = client.download_attachment(attachment_id)
+
+        filename = attachment_info.get('filename', 'unknown')
+        content_type = attachment_info.get('content_type', '')
+        filesize = attachment_info.get('filesize', 0)
+        ext = _get_file_extension(filename)
+
+        # 檢查檔案大小
+        if filesize > MAX_ATTACHMENT_SIZE_BYTES:
+            return f"附件 #{attachment_id} ({filename}) 檔案過大\n" \
+                   f"大小: {filesize / 1024 / 1024:.2f} MB\n" \
+                   f"限制: {MAX_ATTACHMENT_SIZE_BYTES / 1024 / 1024:.0f} MB"
+
+        # 圖片類型 → 提示使用 get_attachment_image
+        if content_type in SUPPORTED_IMAGE_TYPES:
+            return f"附件 #{attachment_id} ({filename}) 是圖片檔案\n" \
+                   f"請使用 get_attachment_image({attachment_id}) 進行視覺分析"
+
+        # 舊版 Office 格式提示
+        if ext in LEGACY_OFFICE_EXTENSIONS:
+            new_ext = ext + 'x'
+            return f"附件 #{attachment_id} ({filename}) 為舊版 Office 格式 ({ext})\n" \
+                   f"目前僅支援新版格式 ({new_ext})，請將檔案轉存為新版格式後重新上傳"
+
+        # Office 文件類型
+        office_type = OFFICE_EXTENSIONS.get(ext)
+        extracted_text = None
+        format_label = ""
+
+        try:
+            if office_type == 'pdf' or content_type == 'application/pdf':
+                extracted_text = _extract_pdf_text(file_data)
+                format_label = "PDF"
+            elif office_type == 'docx' or content_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+                extracted_text = _extract_docx_text(file_data)
+                format_label = "Word"
+            elif office_type == 'xlsx' or content_type == 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':
+                extracted_text = _extract_xlsx_text(file_data)
+                format_label = "Excel"
+            elif office_type == 'pptx' or content_type == 'application/vnd.openxmlformats-officedocument.presentationml.presentation':
+                extracted_text = _extract_pptx_text(file_data)
+                format_label = "PowerPoint"
+        except Exception as e:
+            return f"附件 #{attachment_id} ({filename}) 解析失敗\n" \
+                   f"類型: {content_type}\n" \
+                   f"錯誤: {str(e)}"
+
+        if extracted_text is not None:
+            pass  # 已由上方 Office 解析完成
+        elif content_type in TEXT_MIME_TYPES or content_type.startswith('text/') or ext in TEXT_EXTENSIONS:
+            extracted_text = _try_decode_text(file_data)
+            format_label = "文字"
+            if extracted_text is None:
+                return f"附件 #{attachment_id} ({filename}) 無法解碼為文字\n" \
+                       f"類型: {content_type}"
+        else:
+            # 未知類型 → 嘗試純文字讀取
+            extracted_text = _try_decode_text(file_data)
+            if extracted_text is not None:
+                format_label = "文字（自動偵測）"
+            else:
+                return f"附件 #{attachment_id} ({filename}) 為 binary 檔案，無法讀取文字內容\n" \
+                       f"類型: {content_type}\n" \
+                       f"大小: {filesize / 1024:.2f} KB"
+
+        # 截斷過長內容
+        truncated = False
+        if len(extracted_text) > max_length:
+            extracted_text = extracted_text[:max_length]
+            truncated = True
+
+        header = f"附件 #{attachment_id} ({filename}) - {format_label} 內容"
+        header += f"\n{'=' * 50}\n"
+        result = header + extracted_text
+
+        if truncated:
+            result += f"\n\n... (內容已截斷，原始長度超過 {max_length} 字元)"
+
+        return result
+
+    except RedmineAPIError as e:
+        return f"取得附件內容失敗: {str(e)}"
+    except Exception as e:
+        return f"處理附件錯誤: {str(e)}"
+
+
 @mcp.tool()
 def get_attachment_info(attachment_id: int) -> str:
     """
@@ -1470,10 +1724,20 @@ def get_attachment_info(attachment_id: int) -> str:
 
 下載連結: {attachment.get('content_url', 'N/A')}"""
         
-        # 如果是圖片，提供額外提示
+        # 根據檔案類型提供操作建議
         content_type = attachment.get('content_type', '')
+        att_id = attachment.get('id')
+        att_filename = attachment.get('filename', '')
+        att_ext = _get_file_extension(att_filename)
+
         if content_type in SUPPORTED_IMAGE_TYPES:
-            result += f"\n\n💡 這是圖片檔案，可使用 get_attachment_image({attachment.get('id')}) 進行視覺分析"
+            result += f"\n\n💡 這是圖片檔案，可使用 get_attachment_image({att_id}) 進行視覺分析"
+        elif (content_type == 'application/pdf' or att_ext == '.pdf'
+              or content_type in TEXT_MIME_TYPES or content_type.startswith('text/')
+              or att_ext in TEXT_EXTENSIONS or att_ext in OFFICE_EXTENSIONS):
+            result += f"\n\n💡 可使用 get_attachment_text({att_id}) 讀取文字內容"
+        else:
+            result += f"\n\n💡 可嘗試 get_attachment_text({att_id}) 讀取內容（未知格式將自動嘗試純文字讀取）"
         
         return result
         
