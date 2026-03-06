@@ -214,7 +214,9 @@ class RedmineClient:
     def create_issue(self, project_id: int, subject: str, description: str = "",
                     tracker_id: Optional[int] = None, status_id: Optional[int] = None,
                     priority_id: Optional[int] = None, assigned_to_id: Optional[int] = None,
-                    parent_issue_id: Optional[int] = None, custom_fields: Optional[List[Dict]] = None) -> int:
+                    parent_issue_id: Optional[int] = None, custom_fields: Optional[List[Dict]] = None,
+                    start_date: Optional[str] = None, due_date: Optional[str] = None,
+                    estimated_hours: Optional[float] = None) -> int:
         """建立新議題，回傳議題 ID"""
         # 準備驗證資料
         validation_data = {
@@ -226,7 +228,10 @@ class RedmineClient:
             'priority_id': priority_id,
             'assigned_to_id': assigned_to_id,
             'parent_issue_id': parent_issue_id,
-            'custom_fields': custom_fields
+            'custom_fields': custom_fields,
+            'start_date': start_date,
+            'due_date': due_date,
+            'estimated_hours': estimated_hours,
         }
         
         # 驗證資料
@@ -277,6 +282,8 @@ class RedmineClient:
             update_data['issue']['estimated_hours'] = kwargs['estimated_hours']
         if 'notes' in kwargs:
             update_data['issue']['notes'] = kwargs['notes']
+        if 'custom_fields' in kwargs:
+            update_data['issue']['custom_fields'] = kwargs['custom_fields']
         
         if not update_data['issue']:
             raise RedmineAPIError("沒有提供要更新的欄位")

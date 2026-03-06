@@ -517,14 +517,15 @@ def search_issues(query: str, project_id: int = None, limit: int = 10) -> str:
 
 
 @mcp.tool()
-def update_issue_content(issue_id: int, subject: str = None, description: str = None, 
+def update_issue_content(issue_id: int, subject: str = None, description: str = None,
                         priority_id: int = None, priority_name: str = None,
                         done_ratio: int = None, tracker_id: int = None, tracker_name: str = None,
                         parent_issue_id: int = None, remove_parent: bool = False, start_date: str = None, due_date: str = None,
-                        estimated_hours: float = None) -> str:
+                        estimated_hours: float = None,
+                        custom_fields: list[dict] = None) -> str:
     """
-    更新議題內容（標題、描述、優先級、完成度、追蹤器、日期、工時等）
-    
+    更新議題內容（標題、描述、優先級、完成度、追蹤器、日期、工時、自訂欄位等）
+
     Args:
         issue_id: 議題 ID
         subject: 新的議題標題（可選）
@@ -539,7 +540,8 @@ def update_issue_content(issue_id: int, subject: str = None, description: str = 
         start_date: 新的開始日期 YYYY-MM-DD 格式（可選）
         due_date: 新的完成日期 YYYY-MM-DD 格式（可選）
         estimated_hours: 新的預估工時（可選）
-    
+        custom_fields: 自訂欄位列表（可選），格式: [{"id": 23, "value": "2026-03-01"}, ...]
+
     Returns:
         更新結果訊息
     """
@@ -616,7 +618,16 @@ def update_issue_content(issue_id: int, subject: str = None, description: str = 
                 return "錯誤: 預估工時不能為負數"
             update_data['estimated_hours'] = estimated_hours
             changes.append(f"預估工時: {estimated_hours} 小時")
-        
+
+        if custom_fields is not None:
+            if not isinstance(custom_fields, list):
+                return "錯誤: custom_fields 必須是列表格式，例如 [{\"id\": 23, \"value\": \"2026-03-01\"}]"
+            for cf in custom_fields:
+                if 'id' not in cf or 'value' not in cf:
+                    return "錯誤: 每個自訂欄位必須包含 'id' 和 'value'，例如 {\"id\": 23, \"value\": \"2026-03-01\"}"
+            update_data['custom_fields'] = custom_fields
+            changes.append(f"自訂欄位: {len(custom_fields)} 個欄位已更新")
+
         if not update_data and not changes:
             return "錯誤: 請至少提供一個要更新的欄位"
         
@@ -812,13 +823,15 @@ def assign_issue(issue_id: int, user_id: int = None, user_name: str = None, user
 
 
 @mcp.tool()
-def create_new_issue(project_id: int, subject: str, description: str = "", 
+def create_new_issue(project_id: int, subject: str, description: str = "",
                     tracker_id: int = None, tracker_name: str = None,
                     priority_id: int = None, priority_name: str = None,
-                    assigned_to_id: int = None, assigned_to_name: str = None, assigned_to_login: str = None) -> str:
+                    assigned_to_id: int = None, assigned_to_name: str = None, assigned_to_login: str = None,
+                    parent_issue_id: int = None, start_date: str = None, due_date: str = None,
+                    estimated_hours: float = None, status_id: int = None, status_name: str = None) -> str:
     """
     建立新的 Redmine 議題
-    
+
     Args:
         project_id: 專案 ID
         subject: 議題標題
@@ -830,7 +843,13 @@ def create_new_issue(project_id: int, subject: str, description: str = "",
         assigned_to_id: 指派給的用戶 ID（與 assigned_to_name/assigned_to_login 三選一）
         assigned_to_name: 指派給的用戶姓名（與 assigned_to_id/assigned_to_login 三選一）
         assigned_to_login: 指派給的用戶登入名（與 assigned_to_id/assigned_to_name 三選一）
-    
+        parent_issue_id: 父議題 ID（可選，用於建立子議題）
+        start_date: 開始日期 YYYY-MM-DD 格式（可選）
+        due_date: 完成日期 YYYY-MM-DD 格式（可選）
+        estimated_hours: 預估工時（可選）
+        status_id: 初始狀態 ID（與 status_name 二選一，可選）
+        status_name: 初始狀態名稱（與 status_id 二選一，可選）
+
     Returns:
         建立結果訊息
     """
@@ -867,6 +886,24 @@ def create_new_issue(project_id: int, subject: str, description: str = "",
                 users = client.get_available_users()
                 return f"找不到用戶登入名：「{assigned_to_login}」\n\n可用用戶（登入名）：\n" + "\n".join([f"- {login}" for login in users['by_login'].keys()])
         
+        # 處理狀態參數
+        final_status_id = status_id
+        if status_name:
+            final_status_id = client.find_status_id_by_name(status_name)
+            if not final_status_id:
+                return f"找不到狀態名稱：「{status_name}」\n\n可用狀態：\n" + "\n".join([f"- {name}" for name in client.get_available_statuses().keys()])
+
+        # 驗證日期格式
+        for date_label, date_val in [("開始日期", start_date), ("完成日期", due_date)]:
+            if date_val is not None:
+                try:
+                    datetime.strptime(date_val, '%Y-%m-%d')
+                except ValueError:
+                    return f"錯誤: {date_label}格式必須為 YYYY-MM-DD"
+
+        if estimated_hours is not None and estimated_hours < 0:
+            return "錯誤: 預估工時不能為負數"
+
         # 建立議題
         new_issue_id = client.create_issue(
             project_id=project_id,
@@ -874,7 +911,12 @@ def create_new_issue(project_id: int, subject: str, description: str = "",
             description=description,
             tracker_id=final_tracker_id,
             priority_id=final_priority_id,
-            assigned_to_id=final_assigned_to_id
+            assigned_to_id=final_assigned_to_id,
+            parent_issue_id=parent_issue_id,
+            status_id=final_status_id,
+            start_date=start_date,
+            due_date=due_date,
+            estimated_hours=estimated_hours,
         )
         
         # 取得建立的議題資訊
@@ -889,6 +931,15 @@ def create_new_issue(project_id: int, subject: str, description: str = "",
 狀態: {new_issue.status.get('name', 'N/A')}
 優先級: {new_issue.priority.get('name', 'N/A')}
 指派給: {new_issue.assigned_to.get('name', '未指派') if new_issue.assigned_to else '未指派'}"""
+
+        if parent_issue_id:
+            result += f"\n父議題: #{parent_issue_id}"
+        if start_date:
+            result += f"\n開始日期: {start_date}"
+        if due_date:
+            result += f"\n完成日期: {due_date}"
+        if estimated_hours is not None:
+            result += f"\n預估工時: {estimated_hours} 小時"
 
         if description:
             result += f"\n\n描述:\n{description}"
@@ -1161,6 +1212,90 @@ def get_user(user_id: int) -> str:
         
     except RedmineAPIError as e:
         return f"取得用戶資訊失敗: {str(e)}"
+    except Exception as e:
+        return f"系統錯誤: {str(e)}"
+
+
+@mcp.tool()
+def add_watcher(issue_id: int, user_id: int = None, user_name: str = None, user_login: str = None) -> str:
+    """
+    新增議題觀察者
+
+    Args:
+        issue_id: 議題 ID
+        user_id: 用戶 ID（與 user_name/user_login 三選一）
+        user_name: 用戶姓名（與 user_id/user_login 三選一）
+        user_login: 用戶登入名（與 user_id/user_name 三選一）
+
+    Returns:
+        操作結果訊息
+    """
+    try:
+        client = get_client()
+
+        # 解析用戶 ID
+        final_user_id = user_id
+        if user_name:
+            final_user_id = client.find_user_id_by_name(user_name)
+            if not final_user_id:
+                users = client.get_available_users()
+                return f"找不到用戶姓名：「{user_name}」\n\n可用用戶：\n" + "\n".join([f"- {name}" for name in users['by_name'].keys()])
+        elif user_login:
+            final_user_id = client.find_user_id_by_login(user_login)
+            if not final_user_id:
+                users = client.get_available_users()
+                return f"找不到用戶登入名：「{user_login}」\n\n可用用戶：\n" + "\n".join([f"- {login}" for login in users['by_login'].keys()])
+
+        if not final_user_id:
+            return "錯誤: 請提供 user_id、user_name 或 user_login"
+
+        client.add_watcher(issue_id, final_user_id)
+        return f"已將用戶 (ID: {final_user_id}) 加入議題 #{issue_id} 的觀察者"
+
+    except RedmineAPIError as e:
+        return f"新增觀察者失敗: {str(e)}"
+    except Exception as e:
+        return f"系統錯誤: {str(e)}"
+
+
+@mcp.tool()
+def remove_watcher(issue_id: int, user_id: int = None, user_name: str = None, user_login: str = None) -> str:
+    """
+    移除議題觀察者
+
+    Args:
+        issue_id: 議題 ID
+        user_id: 用戶 ID（與 user_name/user_login 三選一）
+        user_name: 用戶姓名（與 user_id/user_login 三選一）
+        user_login: 用戶登入名（與 user_id/user_name 三選一）
+
+    Returns:
+        操作結果訊息
+    """
+    try:
+        client = get_client()
+
+        # 解析用戶 ID
+        final_user_id = user_id
+        if user_name:
+            final_user_id = client.find_user_id_by_name(user_name)
+            if not final_user_id:
+                users = client.get_available_users()
+                return f"找不到用戶姓名：「{user_name}」\n\n可用用戶：\n" + "\n".join([f"- {name}" for name in users['by_name'].keys()])
+        elif user_login:
+            final_user_id = client.find_user_id_by_login(user_login)
+            if not final_user_id:
+                users = client.get_available_users()
+                return f"找不到用戶登入名：「{user_login}」\n\n可用用戶：\n" + "\n".join([f"- {login}" for login in users['by_login'].keys()])
+
+        if not final_user_id:
+            return "錯誤: 請提供 user_id、user_name 或 user_login"
+
+        client.remove_watcher(issue_id, final_user_id)
+        return f"已將用戶 (ID: {final_user_id}) 從議題 #{issue_id} 的觀察者中移除"
+
+    except RedmineAPIError as e:
+        return f"移除觀察者失敗: {str(e)}"
     except Exception as e:
         return f"系統錯誤: {str(e)}"
 
