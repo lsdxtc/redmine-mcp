@@ -83,6 +83,8 @@ class RedmineClient:
         safe_domain = self.config.redmine_domain.replace('://', '_').replace('/', '_').replace(':', '_')
         self._cache_file = self.cache_dir / f"cache_{safe_domain}_{abs(domain_hash)}.json"
         self._enum_cache: Optional[Dict[str, Any]] = None
+        self._category_cache: Dict[int, Dict[str, int]] = {}  # {project_id: {name: id}}
+        self._issue_snapshots: Dict[int, Dict[str, Any]] = {}  # {issue_id: snapshot}
     
     def _make_request(self, method: str, endpoint: str, **kwargs) -> Dict[str, Any]:
         """執行 HTTP 請求"""
@@ -156,13 +158,46 @@ class RedmineClient:
         params = {}
         if include:
             params['include'] = ','.join(include)
-        
+
         response = self._make_request('GET', f'/issues/{issue_id}.json', params=params)
-        
+
         if 'issue' not in response:
             raise RedmineAPIError(f"議題 {issue_id} 不存在")
-        
-        return response['issue']
+
+        issue_data = response['issue']
+        self._save_issue_snapshot(issue_id, issue_data)
+        return issue_data
+
+    def _save_issue_snapshot(self, issue_id: int, issue_data: Dict[str, Any]):
+        """保存議題快照（用於變更偵測）"""
+        journals = issue_data.get('journals', [])
+        attachments = issue_data.get('attachments', [])
+        self._issue_snapshots[issue_id] = {
+            'snapshot_time': datetime.now().isoformat(),
+            'updated_on': issue_data.get('updated_on'),
+            'status': issue_data.get('status', {}).get('name'),
+            'status_id': issue_data.get('status', {}).get('id'),
+            'priority': issue_data.get('priority', {}).get('name'),
+            'assigned_to': issue_data.get('assigned_to', {}).get('name') if issue_data.get('assigned_to') else None,
+            'done_ratio': issue_data.get('done_ratio', 0),
+            'subject': issue_data.get('subject'),
+            'description': issue_data.get('description', ''),
+            'journals_count': len(journals),
+            'last_journal_id': journals[-1].get('id') if journals else None,
+            'attachments_count': len(attachments),
+            'custom_fields': {
+                cf.get('id'): cf.get('value')
+                for cf in issue_data.get('custom_fields', [])
+            },
+        }
+
+    def get_issue_snapshot(self, issue_id: int) -> Optional[Dict[str, Any]]:
+        """取得議題的快照"""
+        return self._issue_snapshots.get(issue_id)
+
+    def clear_issue_snapshot(self, issue_id: int):
+        """清除議題快照"""
+        self._issue_snapshots.pop(issue_id, None)
     
     def list_issues(self, project_id: Optional[int] = None, status_id: Optional[int] = None, 
                    assigned_to_id: Optional[int] = None, tracker_id: Optional[int] = None,
@@ -216,7 +251,8 @@ class RedmineClient:
                     priority_id: Optional[int] = None, assigned_to_id: Optional[int] = None,
                     parent_issue_id: Optional[int] = None, custom_fields: Optional[List[Dict]] = None,
                     start_date: Optional[str] = None, due_date: Optional[str] = None,
-                    estimated_hours: Optional[float] = None) -> int:
+                    estimated_hours: Optional[float] = None,
+                    category_id: Optional[int] = None) -> int:
         """建立新議題，回傳議題 ID"""
         # 準備驗證資料
         validation_data = {
@@ -232,6 +268,7 @@ class RedmineClient:
             'start_date': start_date,
             'due_date': due_date,
             'estimated_hours': estimated_hours,
+            'category_id': category_id,
         }
         
         # 驗證資料
@@ -282,6 +319,8 @@ class RedmineClient:
             update_data['issue']['estimated_hours'] = kwargs['estimated_hours']
         if 'notes' in kwargs:
             update_data['issue']['notes'] = kwargs['notes']
+        if 'category_id' in kwargs:
+            update_data['issue']['category_id'] = kwargs['category_id']
         if 'custom_fields' in kwargs:
             update_data['issue']['custom_fields'] = kwargs['custom_fields']
         
@@ -440,7 +479,41 @@ class RedmineClient:
         """取得文件分類列表"""
         response = self._make_request('GET', '/enumerations/document_categories.json')
         return response.get('document_categories', [])
-    
+
+    def get_issue_categories(self, project_id: int) -> List[Dict[str, Any]]:
+        """取得專案的議題分類列表"""
+        response = self._make_request('GET', f'/projects/{project_id}/issue_categories.json')
+        return response.get('issue_categories', [])
+
+    def _load_category_cache(self, project_id: int) -> Dict[str, int]:
+        """載入指定專案的議題分類快取（按需載入）"""
+        if project_id in self._category_cache:
+            return self._category_cache[project_id]
+
+        try:
+            categories = self.get_issue_categories(project_id)
+            self._category_cache[project_id] = {
+                item['name']: item['id'] for item in categories
+            }
+        except Exception:
+            self._category_cache[project_id] = {}
+
+        return self._category_cache[project_id]
+
+    def find_category_id_by_name(self, project_id: int, name: str) -> Optional[int]:
+        """根據議題分類名稱找到對應的 ID（專案層級）"""
+        cache = self._load_category_cache(project_id)
+        return cache.get(name)
+
+    def get_available_categories(self, project_id: int) -> Dict[str, int]:
+        """取得指定專案所有可用的議題分類選項（名稱到ID的對應）"""
+        return self._load_category_cache(project_id)
+
+    def refresh_category_cache(self, project_id: int):
+        """刷新指定專案的議題分類快取"""
+        self._category_cache.pop(project_id, None)
+        self._load_category_cache(project_id)
+
     def get_users(self, status: Optional[int] = None, name: Optional[str] = None,
                  group_id: Optional[int] = None, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
         """取得用戶列表"""
