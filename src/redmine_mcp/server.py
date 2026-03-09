@@ -67,13 +67,32 @@ def get_issue(issue_id: int, include_details: bool = True) -> str:
         # 使用新的 get_issue_raw 方法取得完整資料
         issue_data = client.get_issue_raw(issue_id, include=include_params)
         
+        # Emoji 對應表
+        tracker_emojis = {'Bug': '🐛', '缺陷': '🐛', '功能': '✨', 'Feature': '✨', '重構': '🔧', 'Refactor': '🔧', '文件': '📝', 'Documentation': '📝'}
+        priority_emojis = {'低': '🟢', '正常': '🟡', '高': '🟠', '緊急': '🔴', '即時': '🔴'}
+        status_emojis = {'新建立': '📝', '實作中': '🟡', '已回應': '🟡', '已解決': '🟢', '待審核': '🟢', '已結束': '⚫', '已拒絕': '⚫'}
+
         # 格式化基本資訊
-        assigned_to = issue_data.get('assigned_to', {}).get('name', '未指派') if issue_data.get('assigned_to') else '未指派'
+        tracker_name = issue_data['tracker'].get('name', 'N/A')
+        tracker_emoji = tracker_emojis.get(tracker_name, '📋')
+        status_name = issue_data['status'].get('name', 'N/A')
+        status_emoji = status_emojis.get(status_name, '🔵')
+        priority_name = issue_data['priority'].get('name', 'N/A')
+        priority_emoji = priority_emojis.get(priority_name, '🟡')
+
+        assigned_name = issue_data.get('assigned_to', {}).get('name') if issue_data.get('assigned_to') else None
+        assigned_to = f"@{assigned_name}" if assigned_name else '未指派'
         category_info = issue_data.get('category', {}).get('name', '未分類') if issue_data.get('category') else '未分類'
         estimated = issue_data.get('estimated_hours')
         estimated_text = f"{estimated} 小時" if estimated is not None else '未設定'
         spent = issue_data.get('total_spent_hours') or issue_data.get('spent_hours')
         spent_text = f"{spent} 小時" if spent is not None else '未記錄'
+
+        # 提取特定自訂欄位
+        custom_fields = issue_data.get('custom_fields', [])
+        cf_map = {cf.get('id'): cf.get('value', '') for cf in custom_fields}
+        actual_end_date = cf_map.get(23, '未設定')
+        resolve_date = cf_map.get(64, '未設定')
 
         result = f"""# 議題 #{issue_data['id']}: {issue_data['subject']}
 
@@ -82,18 +101,20 @@ def get_issue(issue_id: int, include_details: bool = True) -> str:
 | **Redmine No.** | #{issue_data['id']} |
 | **問題名稱** | {issue_data['subject']} |
 | **專案** | {issue_data['project'].get('name', 'N/A')} (ID: {issue_data['project'].get('id', 'N/A')}) |
-| **問題種類** | {issue_data['tracker'].get('name', 'N/A')} |
-| **狀態** | {issue_data['status'].get('name', 'N/A')} |
-| **優先級** | {issue_data['priority'].get('name', 'N/A')} |
+| **問題種類** | `{tracker_emoji} {tracker_name}` |
+| **狀態** | `{status_emoji} {status_name}` |
+| **優先級** | `{priority_emoji} {priority_name}` |
 | **分類** | {category_info} |
 | **建立者** | {issue_data['author'].get('name', 'N/A')} |
 | **處理者** | {assigned_to} |
-| **完成度** | {issue_data.get('done_ratio', 0)}% |
-| **開始日期** | {issue_data.get('start_date', '未設定')} |
-| **完成日期** | {issue_data.get('due_date', '未設定')} |
+| **完成百分比** | {issue_data.get('done_ratio', 0)}% |
+| **建立時間** | {issue_data.get('created_on', 'N/A')} |
+| **開始時間** | {issue_data.get('start_date', '未設定')} |
+| **結束時間** | {issue_data.get('due_date', '未設定')} |
 | **預估工時** | {estimated_text} |
 | **實際工時** | {spent_text} |
-| **建立時間** | {issue_data.get('created_on', 'N/A')} |
+| **實際結束日期** | {actual_end_date or '未設定'} |
+| **解決日期** | {resolve_date or '未設定'} |
 | **更新時間** | {issue_data.get('updated_on', 'N/A')} |"""
 
         # 父議題
@@ -106,14 +127,12 @@ def get_issue(issue_id: int, include_details: bool = True) -> str:
             children_text = ", ".join([f"#{c.get('id')}" for c in issue_data['children']])
             result += f"\n| **子議題** | {children_text} |"
 
-        # 自訂欄位
-        custom_fields = issue_data.get('custom_fields', [])
-        if custom_fields:
-            for cf in custom_fields:
-                cf_value = cf.get('value', '')
-                if cf_value:
-                    cf_name = cf.get('name', f"ID:{cf.get('id')}")
-                    result += f"\n| **{cf_name}** (ID:{cf.get('id')}) | {cf_value} |"
+        # 自訂欄位（排除已獨立顯示的 id=23, 64）
+        other_cf = [cf for cf in custom_fields if cf.get('id') not in (23, 64) and cf.get('value', '')]
+        if other_cf:
+            for cf in other_cf:
+                cf_name = cf.get('name', f"ID:{cf.get('id')}")
+                result += f"\n| **{cf_name}** (ID:{cf.get('id')}) | {cf.get('value', '')} |"
 
         # 描述
         description = issue_data.get('description', '').strip()
@@ -143,11 +162,12 @@ def get_issue(issue_id: int, include_details: bool = True) -> str:
         # 子議題詳情
         if include_details and 'children' in issue_data and issue_data['children']:
             result += f"\n\n## 子議題（{len(issue_data['children'])} 個）\n"
-            result += "\n| ID | 種類 | 標題 |"
-            result += "\n|----|------|------|"
+            result += "\n| ID | 種類 | 標題 | 狀態 |"
+            result += "\n|----|------|------|------|"
             for child in issue_data['children']:
                 child_tracker = child.get('tracker', {}).get('name', '')
-                result += f"\n| #{child.get('id')} | {child_tracker} | {child.get('subject', 'N/A')} |"
+                child_status = child.get('status', {}).get('name', 'N/A') if child.get('status') else 'N/A'
+                result += f"\n| #{child.get('id')} | {child_tracker} | {child.get('subject', 'N/A')} | {child_status} |"
 
         # 關聯議題
         if include_details and 'relations' in issue_data and issue_data['relations']:
@@ -1530,7 +1550,8 @@ def sync_my_issues(project_id: int = None, status_filter: str = "open", limit: i
         my_user_id = current_user['id']
 
         # 取得我的議題列表
-        status_param = status_filter if status_filter != "all" else "*"
+        status_map = {'open': 'o', 'closed': 'c', 'all': '*', 'o': 'o', 'c': 'c', '*': '*'}
+        status_param = status_map.get(status_filter, 'o')
         issues = client.list_issues(
             project_id=project_id,
             assigned_to_id=my_user_id,
@@ -1615,6 +1636,187 @@ def sync_my_issues(project_id: int = None, status_filter: str = "open", limit: i
 
     except RedmineAPIError as e:
         return f"同步失敗: {str(e)}"
+    except Exception as e:
+        return f"系統錯誤: {str(e)}"
+
+
+@mcp.tool()
+def sync_project_issues(project_id: int, status_filter: str = "open") -> str:
+    """
+    同步專案議題結構並偵測變更
+
+    取得指定專案的所有議題（自動分頁），以樹狀結構呈現父子階層關係，
+    並與本地快照比對標示變更狀態。可重複執行以持續追蹤專案動態。
+
+    Args:
+        project_id: 專案 ID（必要）
+        status_filter: 狀態篩選 ("open", "closed", "all")，預設 "open"
+
+    Returns:
+        專案議題的樹狀結構與變更摘要
+    """
+    try:
+        client = get_client()
+
+        # 分頁取得專案所有議題
+        status_map = {'open': 'o', 'closed': 'c', 'all': '*', 'o': 'o', 'c': 'c', '*': '*'}
+        status_param = status_map.get(status_filter, 'o')
+        issues = []
+        offset = 0
+        page_size = 100  # Redmine API 單次上限
+
+        while True:
+            batch = client.list_issues(
+                project_id=project_id,
+                status_id=status_param,
+                limit=page_size,
+                offset=offset,
+                sort='updated_on:desc'
+            )
+            if not batch:
+                break
+            issues.extend(batch)
+            if len(batch) < page_size:
+                break
+            offset += page_size
+
+        if not issues:
+            return f"專案 #{project_id} 沒有符合條件的議題（篩選: {status_filter}）"
+
+        # 分類議題：有變更 / 首次讀取 / 無變更
+        changed_issues = []
+        new_issues = []
+        unchanged_issues = []
+
+        for issue in issues:
+            issue_id = issue.id
+            snapshot = client.get_issue_snapshot(issue_id)
+
+            if not snapshot:
+                new_issues.append(issue)
+                # 建立快照
+                try:
+                    client.get_issue_raw(issue_id, include=['journals', 'attachments'])
+                except Exception:
+                    pass
+                continue
+
+            # 快速比對 updated_on
+            if issue.updated_on == snapshot.get('updated_on'):
+                unchanged_issues.append(issue)
+                continue
+
+            # 偵測具體變更
+            change_summary = []
+            current_status = issue.status.get('name')
+            if current_status != snapshot['status']:
+                change_summary.append(f"狀態: {snapshot['status']} → {current_status}")
+            if issue.done_ratio != snapshot['done_ratio']:
+                change_summary.append(f"完成度: {snapshot['done_ratio']}% → {issue.done_ratio}%")
+            current_assigned = issue.assigned_to.get('name') if issue.assigned_to else None
+            if current_assigned != snapshot['assigned_to']:
+                change_summary.append(f"指派: {snapshot['assigned_to'] or '未指派'} → {current_assigned or '未指派'}")
+            current_priority = issue.priority.get('name')
+            if current_priority != snapshot['priority']:
+                change_summary.append(f"優先級: {snapshot['priority']} → {current_priority}")
+            if issue.subject != snapshot['subject']:
+                change_summary.append(f"標題已變更")
+
+            if not change_summary:
+                change_summary.append("內容已更新（詳情請使用 check_issue_changes）")
+
+            changed_issues.append((issue, change_summary))
+
+            # 更新快照
+            try:
+                client.get_issue_raw(issue_id, include=['journals', 'attachments'])
+            except Exception:
+                pass
+
+        # 建立父子關係索引
+        all_issues = {issue.id: issue for issue in issues}
+        children_map = {}  # parent_id -> [child_issues]
+        root_issues = []
+
+        for issue in issues:
+            parent_id = issue.parent.get('id') if hasattr(issue, 'parent') and issue.parent else None
+            if parent_id and parent_id in all_issues:
+                children_map.setdefault(parent_id, []).append(issue)
+            else:
+                root_issues.append(issue)
+
+        # 變更狀態查詢表
+        changed_ids = {issue.id for issue, _ in changed_issues}
+        new_ids = {issue.id for issue in new_issues}
+        change_details = {issue.id: summaries for issue, summaries in changed_issues}
+
+        def get_marker(issue_id):
+            if issue_id in changed_ids:
+                return "🔄"
+            elif issue_id in new_ids:
+                return "🆕"
+            return "  "
+
+        def format_issue_line(issue, prefix=""):
+            marker = get_marker(issue.id)
+            tracker = issue.tracker.get('name', '') if hasattr(issue, 'tracker') and issue.tracker else ''
+            status = issue.status.get('name', '') if issue.status else ''
+            assigned = issue.assigned_to.get('name', '未指派') if issue.assigned_to else '未指派'
+            done = issue.done_ratio if hasattr(issue, 'done_ratio') else 0
+            title = issue.subject[:50] + '...' if len(issue.subject) > 50 else issue.subject
+            return f"{prefix}{marker} #{issue.id} [{tracker}][{status}] {title} ({assigned}, {done}%)"
+
+        def build_tree(issue, prefix="", is_last=True):
+            lines = []
+            connector = "└── " if is_last else "├── "
+            lines.append(format_issue_line(issue, prefix + connector if prefix else ""))
+
+            # 變更詳情
+            if issue.id in change_details:
+                detail_prefix = prefix + ("    " if is_last else "│   ") if prefix else "    "
+                for s in change_details[issue.id]:
+                    lines.append(f"{detail_prefix}↳ {s}")
+
+            children = children_map.get(issue.id, [])
+            child_prefix = prefix + ("    " if is_last else "│   ") if prefix else ""
+            for i, child in enumerate(children):
+                is_child_last = (i == len(children) - 1)
+                lines.extend(build_tree(child, child_prefix, is_child_last))
+            return lines
+
+        # 取得專案名稱
+        project_name = ""
+        if issues:
+            project_name = issues[0].project.get('name', '') if hasattr(issues[0], 'project') and issues[0].project else ''
+
+        # 組裝輸出
+        result = f"# 專案議題同步: {project_name} (#{project_id})\n"
+        result += f"篩選: {status_filter} | 共 {len(issues)} 個議題\n"
+        result += f"🔄 有變更: {len(changed_issues)} | 🆕 首次讀取: {len(new_issues)} | ✅ 無變更: {len(unchanged_issues)}\n"
+        result += "=" * 60 + "\n\n"
+
+        # 樹狀結構
+        result += "## 議題結構\n\n"
+        for i, issue in enumerate(root_issues):
+            is_last = (i == len(root_issues) - 1)
+            tree_lines = build_tree(issue, "", is_last)
+            result += "\n".join(tree_lines) + "\n"
+
+        # 變更摘要
+        if changed_issues:
+            result += f"\n## 變更摘要（{len(changed_issues)} 個）\n\n"
+            result += "| 議題 | 種類 | 變更內容 |\n"
+            result += "|------|------|----------|\n"
+            for issue, summaries in changed_issues:
+                tracker = issue.tracker.get('name', '') if hasattr(issue, 'tracker') and issue.tracker else ''
+                changes_text = "; ".join(summaries)
+                title = issue.subject[:30] + '...' if len(issue.subject) > 30 else issue.subject
+                result += f"| #{issue.id} {title} | {tracker} | {changes_text} |\n"
+
+        return result
+
+    except RedmineAPIError as e:
+        return f"同步專案議題失敗: {str(e)}"
     except Exception as e:
         return f"系統錯誤: {str(e)}"
 
